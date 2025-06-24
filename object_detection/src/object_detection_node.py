@@ -18,7 +18,7 @@ from object_detection_msgs.msg import (
     ObjectDetectionInfo,
     ObjectDetectionInfoArray,
 )
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Bool
 
 from object_detection.objectdetectorONNX import ObjectDetectorONNX
 from object_detection.pointprojector import PointProjector
@@ -28,6 +28,11 @@ from object_detection.utils import *
 # from object_detection.ros_numpy import *
 
 from ament_index_python.packages import get_package_share_directory
+
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import PointStamped
+from tf2_geometry_msgs import do_transform_point
+import tf2_ros
 
 
 class ObjectDetectionNode(Node):
@@ -69,6 +74,8 @@ class ObjectDetectionNode(Node):
                 ("object_specific_file", "object_specific.yaml"),
                 ("min_cluster_size", 5),
                 ("cluster_selection_epsilon", 0.08),
+                ("interesting_classes", ["chair", "person", "backpack"]),
+                ("detection_threshold_m", 1.5),
             ],
         )
 
@@ -136,7 +143,7 @@ class ObjectDetectionNode(Node):
                 "iou": self.get_parameter("iou").value,
                 "checkpoint": None,
                 "classes": None,
-                "multiple_instance": False,
+                "multiple_instance": True,
             },
         )
 
@@ -185,6 +192,23 @@ class ObjectDetectionNode(Node):
             self.image_info_callback,
             10,
         )
+
+        self.marker_array   = MarkerArray()
+        self.next_marker_id = 0
+        # new: TF buffer + listener
+        self.tf_buffer   = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # new: marker array publisher
+        self.marker_pub = self.create_publisher(
+            MarkerArray, 'object_markers', 10
+        )
+
+        self.interesting_classes = self.get_parameter('interesting_classes').value
+        self.detection_threshold = self.get_parameter('detection_threshold_m').value
+        self.detected_artifacts = [] # List to store {'class_id': str, 'position': Point}
+        self.get_logger().info(f"Tracking interesting classes: {self.interesting_classes}")
+        self.get_logger().info(f"Using detection threshold: {self.detection_threshold}m")
 
     def image_info_callback(self, msg):
         """Handle camera info message"""
@@ -398,8 +422,69 @@ class ObjectDetectionNode(Node):
             self.object_detection_img_pub.publish(
                 self.image_reader.cv2_to_imgmsg(object_detection_image, "bgr8")
             )
+            artifacts_list_updated = False
+            for object_info in object_info_array.info:
+                if object_info.class_id in self.interesting_classes:
+                
+                    p_cam = PointStamped()
+                    p_cam.header.stamp = image_msg.header.stamp      # use the exact image timestamp
+                    p_cam.header.frame_id = self.optical_frame_id    # e.g. 'rgb_camera_optical_link'
+                    p_cam.point.x = object_info.position.x
+                    p_cam.point.y = object_info.position.y
+                    p_cam.point.z = object_info.position.z
+                    try:
+                        transform = self.tf_buffer.lookup_transform(
+                            'map',                          # target frame
+                            'rgb_camera_optical_link',         # source frame
+                            rclpy.time.Time(),             # zero stamp = latest
+                            timeout=rclpy.duration.Duration(seconds=0.1)
+                        )
+                        p_map = do_transform_point(p_cam, transform)
+                    except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+                        self.get_logger().error(f"TF lookup failed: {str(e)}")
+                        continue
 
-            self.get_logger().debug(f"Processing time: {time.time()-start_time:.3f}s")
+                    is_new = True
+                    for existing_artifact in self.detected_artifacts:
+                        if existing_artifact['class_id'] == object_info.class_id:
+                            dist_sq = (p_map.point.x - existing_artifact['position'].x)**2 + \
+                                      (p_map.point.y - existing_artifact['position'].y)**2 + \
+                                      (p_map.point.z - existing_artifact['position'].z)**2
+                            if dist_sq < self.detection_threshold:
+                                is_new = False
+                                break
+                    
+                    if is_new:
+                        self.get_logger().info(f"New unique artifact '{object_info.class_id}' found at map coordinates: ({p_map.point.x:.2f}, {p_map.point.y:.2f}, {p_map.point.z:.2f})")
+                        self.detected_artifacts.append({
+                            'class_id': object_info.class_id,
+                            'position': p_map.point
+                        })
+                        artifacts_list_updated = True
+
+            if artifacts_list_updated:
+                self.get_logger().info(f"Artifact list updated. Publishing {len(self.detected_artifacts)} markers.")
+                self.marker_array.markers.clear()
+
+                for i, artifact in enumerate(self.detected_artifacts):
+                    marker = Marker()
+                    marker.header.frame_id = 'map'
+                    marker.header.stamp = self.get_clock().now().to_msg()
+                    marker.ns = 'detected_artifacts'
+                    marker.id = i
+                    marker.type = Marker.SPHERE
+                    marker.action = Marker.ADD
+                    marker.pose.position = artifact['position']
+                    marker.pose.orientation.w = 1.0
+                    marker.scale.x = marker.scale.y = marker.scale.z = 0.2
+                    marker.color.r = 1.0
+                    marker.color.g = 0.0
+                    marker.color.b = 0.0
+                    marker.color.a = 1.0
+                    self.marker_array.markers.append(marker)
+                
+                self.marker_pub.publish(self.marker_array)
+                self.get_logger().debug(f"Processing time: {time.time()-start_time:.3f}s")
 
         except Exception as e:
             self.get_logger().error(f"Error in sync_callback: {str(e)}")
