@@ -74,7 +74,7 @@ class ObjectDetectionNode(Node):
                 ("object_specific_file", "object_specific.yaml"),
                 ("min_cluster_size", 5),
                 ("cluster_selection_epsilon", 0.08),
-                ("interesting_classes", ["chair", "person", "backpack"]),
+                ("interesting_classes", ["stop sign", "umbrella", "backpack", "clock", "bottle"]),
                 ("detection_threshold_m", 1.5),
             ],
         )
